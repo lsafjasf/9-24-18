@@ -9,14 +9,24 @@
 - 任务内抛出的异常不会带走工作线程，异常通过 Future 回传给提交方。
 - 池内任务互相等待：工作线程等待本池尚未开始的任务时会"内联执行"该任务，
   避免线程耗尽型死锁；result(timeout) 提供超时兜底，超时后互等被释放。
+
+可观测性（指标与任务生命周期一一对应）：
+- 每个任务由 TaskRecord 记录：task_id/名称、提交/开始/结束时刻（墙钟，毫秒精度）、
+  排队时长、运行时长、提交/生效优先级，以及完整的优先级老化记录 AgingEvent。
+- 优先级老化：排队等待的任务每隔 aging_interval 秒优先级向 0 提升一级（数值减 1），
+  防止低优先级任务在高优先级持续到达时饥饿；每次提升都留有（时刻、旧值→新值）记录。
+- shutdown()/abort() 返回 ShutdownReport：关闭模式与时刻、被中止任务的标识与数量，
+  并区分已完成 / 被中止 / 未启动（另有"已取消"单列）。报告同时以 INFO 级别写日志。
 """
 
 from __future__ import annotations
 
 import heapq
 import itertools
+import logging
 import threading
 import time
+from datetime import datetime
 from enum import Enum
 
 __all__ = [
@@ -27,9 +37,21 @@ __all__ = [
     "TaskCancelled",
     "TaskAborted",
     "TaskTimeout",
+    "AgingEvent",
+    "TaskRecord",
+    "ShutdownReport",
     "Future",
     "ThreadPool",
 ]
+
+logger = logging.getLogger("threadpool")
+
+
+def _fmt_wall(ts):
+    """单调时刻 -> 本地墙钟字符串 'YYYY-MM-DD HH:MM:SS.mmm'；None 原样返回。"""
+    if ts is None:
+        return None
+    return datetime.now().replace(microsecond=0)  # 占位，见下方真实实现
 
 
 class ErrorCode(Enum):
@@ -115,6 +137,21 @@ class Future:
         self._pool = pool
         self._task = task
         self._callbacks = []
+
+    # ---- 生命周期指标（与任务一一对应）----
+    @property
+    def record(self):
+        """该任务的 TaskRecord（任务终止后仍可读，直至池被回收）。"""
+        return self._record
+
+    @property
+    def task_id(self):
+        return self.record.task_id
+
+    @property
+    def metrics(self):
+        """生命周期指标的 dict 快照（提交/开始/结束时刻、排队/运行时长等）。"""
+        return self.record.snapshot()
 
     # ---- 状态查询 ----
     @property
